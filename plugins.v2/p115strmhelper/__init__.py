@@ -4,6 +4,7 @@ import shutil
 import base64
 import re
 import traceback
+from copy import deepcopy
 from threading import Event as ThreadEvent, Timer
 from queue import Queue, Empty
 from collections import defaultdict
@@ -41,6 +42,12 @@ from p115rsacipher import encrypt, decrypt
 from .db_manager import ct_db_manager
 from .db_manager.init import init_db, update_db
 from .db_manager.oper import FileDbHelper
+from .msg.framework.callbacks import decode_action, Action
+from .msg.framework.manager import BaseSessionManager
+from .msg.framework.schemas import TSession
+from .msg.schemas import Session
+from .msg.handler import ActionHandler
+from .msg.views import ViewRenderer
 
 from app import schemas
 from app.schemas import (
@@ -68,6 +75,7 @@ from app.utils.system import SystemUtils
 
 directory_upload_dict = defaultdict(threading.Lock)
 p115_open_lock = threading.Lock()
+p115_sh_session_manager = BaseSessionManager(session_class=Session)
 
 
 def check_response(
@@ -1995,6 +2003,12 @@ class P115StrmHelper(_PluginBase):
             Path(temp_path).mkdir(parents=True, exist_ok=True)
         self.init_database()
 
+        # 实例化处理器和渲染器
+        self.action_handler = ActionHandler()
+        self.view_renderer = ViewRenderer()
+        # 初始化时设置超时
+        p115_sh_session_manager.set_timeout(10)
+
     def __getattr__(self, key):
         """
         动态获取配置项 - 解决IDE警告
@@ -2043,6 +2057,8 @@ class P115StrmHelper(_PluginBase):
 
         if self._enabled:
             self.init_database()
+
+            p115_sh_session_manager.set_timeout(10)
 
             try:
                 self._client = P115Client(self._cookies)
@@ -2232,6 +2248,13 @@ class P115StrmHelper(_PluginBase):
                 "desc": "全量生成指定网盘目录STRM",
                 "category": "",
                 "data": {"action": "p115_strm"},
+            },
+            {
+                "cmd": "/p115_sh",
+                "event": EventType.PluginAction,
+                "desc": "搜索TG资源",
+                "category": "",
+                "data": {"action": "p115_sh"},
             },
         ]
 
@@ -5173,3 +5196,120 @@ class P115StrmHelper(_PluginBase):
         return self._check_qrcode_api_internal(
             uid=uid, _time=_time, sign=sign, client_type=client_type
         )
+
+    @eventmanager.register(EventType.PluginAction)
+    def command_action(self, event: Event):
+        """
+        处理初始化的 start 命令。
+        """
+        event_data = event.event_data
+        if not event_data or event_data.get("action") != "p115_sh":
+            return
+        if not self.config.enabled:
+            logger.warning(f"【TG搜索】插件 {self.plugin_name} 已禁用，无法处理命令。")
+            return
+
+        try:
+            session = p115_sh_session_manager.get_or_create(
+                event_data, plugin_id=self._plugin_id
+            )
+            # 直接进入开始视图
+            session.go_to("start")
+            self._render_and_send(session)
+        except Exception as e:
+            logger.error(f"【TG搜索】处理 start 命令失败: {e}", exc_info=True)
+
+    @eventmanager.register(EventType.MessageAction)
+    def message_action(self, event: Event):
+        """
+        处理按钮点击回调，这是重构的核心。
+        """
+        event_data = event.event_data
+        callback_text = event_data.get("text", "")
+
+        # 1. 解码 Action
+        session_id, action = decode_action(callback_text=callback_text)
+        if not session_id or not action:
+            # 如果解码失败或不属于本插件，则忽略
+            return
+
+        # 2. 获取会话
+        session = p115_sh_session_manager.get(session_id)
+        if not session:
+            context = {
+                "channel": event_data.get("channel"),
+                "source": event_data.get("source"),
+                "userid": event_data.get("userid") or event_data.get("user"),
+                "original_message_id": event_data.get("original_message_id"),
+                "original_chat_id": event_data.get("original_chat_id"),
+            }
+            self.post_message(
+                **context,
+                title="⚠️ 会话已过期",
+                text=f"操作已超时。\n请重新发起 `/{self._plugin_id.lower()}_start` 命令。",
+            )
+            return
+
+        # 3. 更新会话上下文并检查权限
+        session.update_message_context(event_data)
+
+        # 4. 委托给 ActionHandler 处理业务逻辑
+        immediate_messages = self.action_handler.process(session, action)
+        if immediate_messages:
+            for msg in immediate_messages:
+                self.__send_message(session, text=msg.get("text"), title="错误")
+                return
+
+        # 5. 渲染新视图并发送
+        self._render_and_send(session)
+
+    @property
+    def _plugin_id(self) -> str:
+        """
+        获取插件的唯一标识符。
+        """
+        return self.__class__.__name__
+
+    def _render_and_send(self, session: TSession):
+        """
+        根据 Session 的当前状态，渲染视图并发送/编辑消息。
+        """
+        # 1. 委托给 ViewRenderer 生成界面数据
+        render_data = self.view_renderer.render(session)
+
+        # 2. 发送或编辑消息
+        self.__send_message(session, render_data=render_data)
+
+        # 3. 处理会话结束逻辑
+        if session.business.current_view == "close":
+            # 深复制session留作删除消息使用
+            copy_session = deepcopy(session)
+            p115_sh_session_manager.end(session.session_id)
+            # 等待一段时间让用户看到“已关闭”的消息
+            time.sleep(10)
+            self.__delete_message(copy_session)
+
+    @staticmethod
+    def __get_message_context(session: TSession) -> dict:
+        """
+        从会话中提取用于发送消息的上下文。
+        """
+        return asdict(session.message)
+
+    def __send_message(
+        self, session: TSession, render_data: Optional[dict] = None, **kwargs
+    ):
+        """
+        统一的消息发送接口。
+        """
+        context = self.__get_message_context(session)
+        if render_data:
+            context.update(render_data)
+        context.update(kwargs)
+        # 将 user key改名成 userid，规避传入值只是user
+        userid = context.get("user")
+        if userid:
+            context["userid"] = userid
+            # 删除多余的 user 键
+            del context["user"]
+        self.post_message(**context)
